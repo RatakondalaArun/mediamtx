@@ -24,6 +24,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/confwatcher"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
+	"github.com/bluenviron/mediamtx/internal/extras"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/metrics"
 	"github.com/bluenviron/mediamtx/internal/playback"
@@ -168,6 +169,25 @@ func New(args []string) (*Core, bool) {
 	if err != nil {
 		fmt.Printf("ERR: %s\n", err)
 		return nil, false
+	}
+
+	// Loads config from API if MEDIAMTX_CONFIG_URL is set
+	if MEDIAMTX_CONFIG_URL := os.Getenv("MEDIAMTX_CONFIG_URL"); MEDIAMTX_CONFIG_URL != "" {
+		tempLogger.Log(logger.Info, "loading configuration from API URL: %s", MEDIAMTX_CONFIG_URL)
+		c, err := extras.LoadConfigFromAPI(MEDIAMTX_CONFIG_URL)
+
+		if err != nil {
+			tempLogger.Log(logger.Error, "failed to load config from API URL: %s, continuing with file config", err)
+		} else {
+			tempLogger.Log(logger.Info, "configuration loaded from API URL")
+
+			if err := c.Validate(tempLogger); err != nil {
+				tempLogger.Log(logger.Error, "URL config validation error: %s", err)
+			} else {
+				tempLogger.Log(logger.Info, "URL config validated")
+				p.conf = c
+			}
+		}
 	}
 
 	err = p.createResources(true)
