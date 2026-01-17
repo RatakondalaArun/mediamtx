@@ -17,7 +17,7 @@ RUN go build -o mediamtx
 #################################################################
 FROM alpine:3.22
 
-RUN apk add --no-cache ffmpeg
+RUN apk add --no-cache ffmpeg mosquitto-clients
 
 COPY --from=builder /s/mediamtx /mediamtx
 COPY --from=builder /s/mediamtx.yml /mediamtx.yml
