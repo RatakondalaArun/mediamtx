@@ -11,20 +11,20 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
 	"github.com/pion/rtp"
 
-	"github.com/bluenviron/mediamtx/internal/counterdumper"
+	"github.com/bluenviron/mediamtx/internal/errordumper"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
 // Stream is a media stream.
-// It stores tracks, readers and allows to write data to readers, converting it when needed.
+// It stores tracks, readers and allows to write data to readers, remuxing it when needed.
 type Stream struct {
-	WriteQueueSize     int
-	RTPMaxPayloadSize  int
-	Desc               *description.Session
-	GenerateRTPPackets bool
-	FillNTP            bool
-	Parent             logger.Writer
+	Desc              *description.Session
+	UseRTPPackets     bool
+	WriteQueueSize    int
+	RTPMaxPayloadSize int
+	ReplaceNTP        bool
+	Parent            logger.Writer
 
 	bytesReceived    *uint64
 	bytesSent        *uint64
@@ -33,7 +33,7 @@ type Stream struct {
 	rtspStream       *gortsplib.ServerStream
 	rtspsStream      *gortsplib.ServerStream
 	readers          map[*Reader]struct{}
-	processingErrors *counterdumper.CounterDumper
+	processingErrors *errordumper.Dumper
 }
 
 // Initialize initializes a Stream.
@@ -43,28 +43,28 @@ func (s *Stream) Initialize() error {
 	s.medias = make(map[*description.Media]*streamMedia)
 	s.readers = make(map[*Reader]struct{})
 
-	s.processingErrors = &counterdumper.CounterDumper{
-		OnReport: func(val uint64) {
-			s.Parent.Log(logger.Warn, "%d processing %s",
-				val,
-				func() string {
-					if val == 1 {
-						return "error"
-					}
-					return "errors"
-				}())
+	s.processingErrors = &errordumper.Dumper{
+		OnReport: func(val uint64, last error) {
+			if val == 1 {
+				s.Parent.Log(logger.Warn, "processing error: %v", last)
+			} else {
+				s.Parent.Log(logger.Warn, "%d processing errors, last was: %v", val, last)
+			}
 		},
 	}
 	s.processingErrors.Start()
 
 	for _, media := range s.Desc.Medias {
 		s.medias[media] = &streamMedia{
-			rtpMaxPayloadSize:  s.RTPMaxPayloadSize,
-			media:              media,
-			generateRTPPackets: s.GenerateRTPPackets,
-			fillNTP:            s.FillNTP,
-			processingErrors:   s.processingErrors,
-			parent:             s.Parent,
+			media:             media,
+			useRTPPackets:     s.UseRTPPackets,
+			rtpMaxPayloadSize: s.RTPMaxPayloadSize,
+			replaceNTP:        s.ReplaceNTP,
+			onBytesReceived:   s.onBytesReceived,
+			onBytesSent:       s.onBytesSent,
+			writeRTSP:         s.writeRTSP,
+			processingErrors:  s.processingErrors,
+			parent:            s.Parent,
 		}
 		err := s.medias[media].initialize()
 		if err != nil {
@@ -196,22 +196,27 @@ func (s *Stream) WriteUnit(medi *description.Media, forma format.Format, u *unit
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
-	sf.writeUnit(s, medi, u)
+	sf.writeUnit(u)
 }
 
-// WriteRTPPacket writes a RTP packet.
-func (s *Stream) WriteRTPPacket(
-	medi *description.Media,
-	forma format.Format,
-	pkt *rtp.Packet,
-	ntp time.Time,
-	pts int64,
-) {
-	sm := s.medias[medi]
-	sf := sm.formats[forma]
+func (s *Stream) onBytesReceived(v uint64) {
+	atomic.AddUint64(s.bytesReceived, v)
+}
 
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
+func (s *Stream) onBytesSent(v uint64) {
+	atomic.AddUint64(s.bytesSent, v)
+}
 
-	sf.writeRTPPacket(s, medi, pkt, ntp, pts)
+func (s *Stream) writeRTSP(medi *description.Media, pkts []*rtp.Packet, ntp time.Time) {
+	if s.rtspStream != nil {
+		for _, pkt := range pkts {
+			s.rtspStream.WritePacketRTPWithNTP(medi, pkt, ntp) //nolint:errcheck
+		}
+	}
+
+	if s.rtspsStream != nil {
+		for _, pkt := range pkts {
+			s.rtspsStream.WritePacketRTPWithNTP(medi, pkt, ntp) //nolint:errcheck
+		}
+	}
 }

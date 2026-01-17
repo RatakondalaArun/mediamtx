@@ -13,10 +13,12 @@ import (
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/counterdumper"
 	"github.com/bluenviron/mediamtx/internal/defs"
+	"github.com/bluenviron/mediamtx/internal/errordumper"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/udp"
 	"github.com/bluenviron/mediamtx/internal/protocols/unix"
 	"github.com/bluenviron/mediamtx/internal/stream"
+	"github.com/bluenviron/mediamtx/internal/unit"
 	"github.com/pion/rtp"
 )
 
@@ -102,7 +104,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 }
 
 func (s *Source) runReader(desc *description.Session, nc net.Conn) error {
-	packetsLost := &counterdumper.CounterDumper{
+	packetsLost := &counterdumper.Dumper{
 		OnReport: func(val uint64) {
 			s.Log(logger.Warn, "%d RTP %s lost",
 				val,
@@ -118,16 +120,13 @@ func (s *Source) runReader(desc *description.Session, nc net.Conn) error {
 	packetsLost.Start()
 	defer packetsLost.Stop()
 
-	decodeErrors := &counterdumper.CounterDumper{
-		OnReport: func(val uint64) {
-			s.Log(logger.Warn, "%d decode %s",
-				val,
-				func() string {
-					if val == 1 {
-						return "error"
-					}
-					return "errors"
-				}())
+	decodeErrors := &errordumper.Dumper{
+		OnReport: func(val uint64, last error) {
+			if val == 1 {
+				s.Log(logger.Warn, "decode error: %v", last)
+			} else {
+				s.Log(logger.Warn, "%d decode errors, last was: %v", val, last)
+			}
 		},
 	}
 	decodeErrors.Start()
@@ -169,7 +168,7 @@ func (s *Source) runReader(desc *description.Session, nc net.Conn) error {
 		err = pkt.Unmarshal(buf[:n])
 		if err != nil {
 			if strm != nil {
-				decodeErrors.Increase()
+				decodeErrors.Add(err)
 				continue
 			}
 			return err
@@ -177,9 +176,9 @@ func (s *Source) runReader(desc *description.Session, nc net.Conn) error {
 
 		if strm == nil {
 			res := s.Parent.SetReady(defs.PathSourceStaticSetReadyReq{
-				Desc:               desc,
-				GenerateRTPPackets: false,
-				FillNTP:            true,
+				Desc:          desc,
+				UseRTPPackets: true,
+				ReplaceNTP:    true,
 			})
 			if res.Err != nil {
 				return res.Err
@@ -209,7 +208,10 @@ func (s *Source) runReader(desc *description.Session, nc net.Conn) error {
 				continue
 			}
 
-			strm.WriteRTPPacket(media.desc, forma.desc, pkt, time.Time{}, pts)
+			strm.WriteUnit(media.desc, forma.desc, &unit.Unit{
+				PTS:        pts,
+				RTPPackets: []*rtp.Packet{pkt},
+			})
 		}
 	}
 }
