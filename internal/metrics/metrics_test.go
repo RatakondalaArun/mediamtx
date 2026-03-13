@@ -1,4 +1,4 @@
-package metrics
+package metrics //nolint:revive
 
 import (
 	"fmt"
@@ -17,7 +17,9 @@ import (
 )
 
 func ptrOf[T any](v T) *T {
-	return &v
+	p := new(T)
+	*p = v
+	return p
 }
 
 type dummyPathManager struct{}
@@ -26,10 +28,10 @@ func (dummyPathManager) APIPathsList() (*defs.APIPathList, error) {
 	return &defs.APIPathList{
 		ItemCount: 1,
 		PageCount: 1,
-		Items: []*defs.APIPath{{
+		Items: []defs.APIPath{{
 			Name:     "mypath",
 			ConfName: "mypathconf",
-			Source: &defs.APIPathSourceOrReader{
+			Source: &defs.APIPathSource{
 				Type: "testing",
 				ID:   "123324354",
 			},
@@ -38,7 +40,7 @@ func (dummyPathManager) APIPathsList() (*defs.APIPathList, error) {
 			Tracks:        []string{"H264", "H265"},
 			BytesReceived: 123,
 			BytesSent:     456,
-			Readers: []defs.APIPathSourceOrReader{
+			Readers: []defs.APIPathReader{
 				{
 					Type: "testing",
 					ID:   "345234423",
@@ -58,7 +60,7 @@ func (dummyHLSServer) APIMuxersList() (*defs.APIHLSMuxerList, error) {
 	return &defs.APIHLSMuxerList{
 		ItemCount: 1,
 		PageCount: 1,
-		Items: []*defs.APIHLSMuxer{{
+		Items: []defs.APIHLSMuxer{{
 			Path:        "mypath",
 			Created:     time.Date(2003, 11, 4, 23, 15, 7, 0, time.UTC),
 			LastRequest: time.Date(2003, 11, 4, 23, 15, 7, 0, time.UTC),
@@ -77,7 +79,7 @@ func (dummyRTSPServer) APIConnsList() (*defs.APIRTSPConnsList, error) {
 	return &defs.APIRTSPConnsList{
 		ItemCount: 1,
 		PageCount: 1,
-		Items: []*defs.APIRTSPConn{{
+		Items: []defs.APIRTSPConn{{
 			ID:            uuid.MustParse("18294761-f9d1-4ea9-9a35-fe265b62eb41"),
 			Created:       time.Date(2003, 11, 4, 23, 15, 7, 0, time.UTC),
 			RemoteAddr:    "124.5.5.5:34542",
@@ -96,7 +98,7 @@ func (dummyRTSPServer) APISessionsList() (*defs.APIRTSPSessionList, error) {
 	return &defs.APIRTSPSessionList{
 		ItemCount: 1,
 		PageCount: 1,
-		Items: []*defs.APIRTSPSession{{
+		Items: []defs.APIRTSPSession{{
 			ID:                  uuid.MustParse("124b22ce-9c34-4387-b045-44caf98049f7"),
 			Created:             time.Date(2003, 11, 4, 23, 15, 7, 0, time.UTC),
 			RemoteAddr:          "124.5.5.5:34542",
@@ -132,7 +134,7 @@ func (dummyRTMPServer) APIConnsList() (*defs.APIRTMPConnList, error) {
 	return &defs.APIRTMPConnList{
 		ItemCount: 1,
 		PageCount: 1,
-		Items: []*defs.APIRTMPConn{{
+		Items: []defs.APIRTMPConn{{
 			ID:            uuid.MustParse("9a07afe4-fc07-4c9b-be6e-6255720c36d0"),
 			Created:       time.Date(2003, 11, 4, 23, 15, 7, 0, time.UTC),
 			RemoteAddr:    "3.3.3.3:5678",
@@ -159,7 +161,7 @@ func (dummyWebRTCServer) APISessionsList() (*defs.APIWebRTCSessionList, error) {
 	return &defs.APIWebRTCSessionList{
 		ItemCount: 1,
 		PageCount: 1,
-		Items: []*defs.APIWebRTCSession{{
+		Items: []defs.APIWebRTCSession{{
 			ID:                        uuid.MustParse("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
 			Created:                   time.Date(2003, 11, 4, 23, 15, 7, 0, time.UTC),
 			RemoteAddr:                "127.0.0.1:3455",

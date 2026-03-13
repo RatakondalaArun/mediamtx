@@ -2,7 +2,9 @@
 package hls
 
 import (
+	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/errordumper"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/packetdumper"
 	"github.com/bluenviron/mediamtx/internal/protocols/hls"
 	"github.com/bluenviron/mediamtx/internal/protocols/tls"
 	"github.com/bluenviron/mediamtx/internal/stream"
@@ -26,6 +29,7 @@ type parent interface {
 
 // Source is a HLS static source.
 type Source struct {
+	DumpPackets bool
 	ReadTimeout conf.Duration
 	Parent      parent
 }
@@ -37,10 +41,10 @@ func (s *Source) Log(level logger.Level, format string, args ...any) {
 
 // Run implements StaticSource.
 func (s *Source) Run(params defs.StaticSourceRunParams) error {
-	var strm *stream.Stream
+	var subStream *stream.SubStream
 
 	defer func() {
-		if strm != nil {
+		if subStream != nil {
 			s.Parent.SetNotReady(defs.PathSourceStaticSetNotReadyReq{})
 		}
 	}()
@@ -63,10 +67,22 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 		return err
 	}
 
+	dialContext := (&net.Dialer{}).DialContext
+
+	if s.DumpPackets {
+		dialContext = (&packetdumper.DialContext{
+			Prefix:      "hls_source_conn",
+			DialContext: dialContext,
+		}).Do
+	}
+
 	tr := &http.Transport{
+		DialContext:     dialContext,
 		TLSClientConfig: tls.MakeConfig(u.Hostname(), params.Conf.SourceFingerprint),
 	}
 	defer tr.CloseIdleConnections()
+
+	jar, _ := cookiejar.New(nil)
 
 	var c *gohlslib.Client
 	c = &gohlslib.Client{
@@ -74,6 +90,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 		HTTPClient: &http.Client{
 			Timeout:   time.Duration(s.ReadTimeout),
 			Transport: tr,
+			Jar:       jar,
 		},
 		OnDownloadPrimaryPlaylist: func(u string) {
 			s.Log(logger.Debug, "downloading primary playlist %v", u)
@@ -91,7 +108,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 			decodeErrors.Add(err)
 		},
 		OnTracks: func(tracks []*gohlslib.Track) error {
-			medias, err2 := hls.ToStream(c, tracks, params.Conf, &strm)
+			medias, err2 := hls.ToStream(c, tracks, params.Conf, &subStream)
 			if err2 != nil {
 				return err2
 			}
@@ -105,7 +122,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 				return res.Err
 			}
 
-			strm = res.Stream
+			subStream = res.SubStream
 
 			return nil
 		},
@@ -138,8 +155,8 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 }
 
 // APISourceDescribe implements StaticSource.
-func (*Source) APISourceDescribe() defs.APIPathSourceOrReader {
-	return defs.APIPathSourceOrReader{
+func (*Source) APISourceDescribe() *defs.APIPathSource {
+	return &defs.APIPathSource{
 		Type: "hlsSource",
 		ID:   "",
 	}

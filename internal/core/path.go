@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
@@ -28,9 +29,10 @@ func emptyTimer() *time.Timer {
 
 type pathParent interface {
 	logger.Writer
-	pathReady(*path)
-	pathNotReady(*path)
-	closePath(*path)
+	setPathReady(*path)
+	setPathNotReady(*path)
+	closePathIfIdle(*path)
+	removePath(*path)
 	AddReader(req defs.PathAddReaderReq) (defs.Path, *stream.Stream, error)
 }
 
@@ -66,6 +68,7 @@ type pathAPIPathsGetReq struct {
 type path struct {
 	parentCtx         context.Context
 	logLevel          conf.LogLevel
+	dumpPackets       bool
 	rtspAddress       string
 	readTimeout       conf.Duration
 	writeTimeout      conf.Duration
@@ -79,14 +82,19 @@ type path struct {
 	externalCmdPool   *externalcmd.Pool
 	parent            pathParent
 
+	// accessed by pathManager only
+	ready    bool
+	confName string
+
 	ctx                            context.Context
 	ctxCancel                      func()
+	pendingRequests                *int64
 	confMutex                      sync.RWMutex
 	source                         defs.Source
-	publisherQuery                 string
 	stream                         *stream.Stream
 	recorder                       *recorder.Recorder
-	readyTime                      time.Time
+	availableTime                  time.Time
+	onlineTime                     time.Time
 	onUnDemandHook                 func(string)
 	onNotReadyHook                 func()
 	readers                        map[defs.Reader]struct{}
@@ -117,8 +125,10 @@ type path struct {
 func (pa *path) initialize() {
 	ctx, ctxCancel := context.WithCancel(pa.parentCtx)
 
+	pa.confName = pa.conf.Name
 	pa.ctx = ctx
 	pa.ctxCancel = ctxCancel
+	pa.pendingRequests = new(int64)
 	pa.readers = make(map[defs.Reader]struct{})
 	pa.onDemandStaticSourceReadyTimer = emptyTimer()
 	pa.onDemandStaticSourceCloseTimer = emptyTimer()
@@ -158,13 +168,24 @@ func (pa *path) Name() string {
 	return pa.name
 }
 
-func (pa *path) isReady() bool {
+func (pa *path) isAvailable() bool {
 	return pa.stream != nil
+}
+
+func (pa *path) isOnline() bool {
+	return pa.source != nil
 }
 
 func (pa *path) run() {
 	defer close(pa.done)
 	defer pa.wg.Done()
+
+	if pa.conf.AlwaysAvailable {
+		err := pa.setAvailable(nil, "", nil, true)
+		if err != nil {
+			panic(err)
+		}
+	}
 
 	if pa.conf.Source == "redirect" {
 		pa.source = &sourceRedirect{}
@@ -172,6 +193,7 @@ func (pa *path) run() {
 		pa.source = &staticsources.Handler{
 			Conf:              pa.conf,
 			LogLevel:          pa.logLevel,
+			DumpPackets:       pa.dumpPackets,
 			ReadTimeout:       pa.readTimeout,
 			WriteTimeout:      pa.writeTimeout,
 			WriteQueueSize:    pa.writeQueueSize,
@@ -198,7 +220,7 @@ func (pa *path) run() {
 	err := pa.runInner()
 
 	// call before destroying context
-	pa.parent.closePath(pa)
+	pa.parent.removePath(pa)
 
 	pa.ctxCancel()
 
@@ -218,7 +240,7 @@ func (pa *path) run() {
 	}
 
 	if pa.stream != nil {
-		pa.setNotReady()
+		pa.setNotAvailable()
 	}
 
 	if pa.source != nil {
@@ -245,21 +267,21 @@ func (pa *path) runInner() error {
 			pa.doOnDemandStaticSourceReadyTimer()
 
 			if pa.shouldClose() {
-				return fmt.Errorf("not in use")
+				pa.parent.closePathIfIdle(pa)
 			}
 
 		case <-pa.onDemandStaticSourceCloseTimer.C:
 			pa.doOnDemandStaticSourceCloseTimer()
 
 			if pa.shouldClose() {
-				return fmt.Errorf("not in use")
+				pa.parent.closePathIfIdle(pa)
 			}
 
 		case <-pa.onDemandPublisherReadyTimer.C:
 			pa.doOnDemandPublisherReadyTimer()
 
 			if pa.shouldClose() {
-				return fmt.Errorf("not in use")
+				pa.parent.closePathIfIdle(pa)
 			}
 
 		case <-pa.onDemandPublisherCloseTimer.C:
@@ -275,31 +297,41 @@ func (pa *path) runInner() error {
 			pa.doSourceStaticSetNotReady(req)
 
 			if pa.shouldClose() {
-				return fmt.Errorf("not in use")
+				pa.parent.closePathIfIdle(pa)
 			}
 
 		case req := <-pa.chDescribe:
 			pa.doDescribe(req)
 
+			atomic.AddInt64(pa.pendingRequests, -1)
+
 			if pa.shouldClose() {
-				return fmt.Errorf("not in use")
+				pa.parent.closePathIfIdle(pa)
 			}
 
 		case req := <-pa.chAddPublisher:
 			pa.doAddPublisher(req)
 
+			atomic.AddInt64(pa.pendingRequests, -1)
+
+			if pa.shouldClose() {
+				pa.parent.closePathIfIdle(pa)
+			}
+
 		case req := <-pa.chRemovePublisher:
 			pa.doRemovePublisher(req)
 
 			if pa.shouldClose() {
-				return fmt.Errorf("not in use")
+				pa.parent.closePathIfIdle(pa)
 			}
 
 		case req := <-pa.chAddReader:
 			pa.doAddReader(req)
 
+			atomic.AddInt64(pa.pendingRequests, -1)
+
 			if pa.shouldClose() {
-				return fmt.Errorf("not in use")
+				pa.parent.closePathIfIdle(pa)
 			}
 
 		case req := <-pa.chRemoveReader:
@@ -329,7 +361,10 @@ func (pa *path) doOnDemandStaticSourceReadyTimer() {
 }
 
 func (pa *path) doOnDemandStaticSourceCloseTimer() {
-	pa.setNotReady()
+	if pa.conf.AlwaysAvailable {
+		panic("should not happen")
+	}
+	pa.setNotAvailable()
 	pa.onDemandStaticSourceStop("not needed by anyone")
 }
 
@@ -379,10 +414,29 @@ func (pa *path) doReloadConf(newConf *conf.Path) {
 }
 
 func (pa *path) doSourceStaticSetReady(req defs.PathSourceStaticSetReadyReq) {
-	err := pa.setReady(req.Desc, req.UseRTPPackets, req.ReplaceNTP)
+	if !pa.conf.AlwaysAvailable {
+		err := pa.setAvailable(pa.source, "", req.Desc, req.ReplaceNTP)
+		if err != nil {
+			req.Res <- defs.PathSourceStaticSetReadyRes{Err: err}
+			return
+		}
+	}
+
+	subStream := &stream.SubStream{
+		Stream:        pa.stream,
+		UseRTPPackets: req.UseRTPPackets,
+	}
+	if pa.conf.AlwaysAvailable {
+		subStream.CurDesc = req.Desc
+	}
+	err := subStream.Initialize()
 	if err != nil {
 		req.Res <- defs.PathSourceStaticSetReadyRes{Err: err}
 		return
+	}
+
+	if pa.conf.AlwaysAvailable {
+		pa.onlineTime = time.Now()
 	}
 
 	if pa.conf.HasOnDemandStaticSource() {
@@ -393,11 +447,18 @@ func (pa *path) doSourceStaticSetReady(req defs.PathSourceStaticSetReadyReq) {
 
 	pa.consumeOnHoldRequests()
 
-	req.Res <- defs.PathSourceStaticSetReadyRes{Stream: pa.stream}
+	req.Res <- defs.PathSourceStaticSetReadyRes{SubStream: subStream}
 }
 
 func (pa *path) doSourceStaticSetNotReady(req defs.PathSourceStaticSetNotReadyReq) {
-	pa.setNotReady()
+	if !pa.conf.AlwaysAvailable {
+		pa.setNotAvailable()
+	} else {
+		err := pa.stream.StartOfflineSubStream()
+		if err != nil {
+			panic("should not happen")
+		}
+	}
 
 	// send response before calling onDemandStaticSourceStop()
 	// in order to avoid a deadlock due to staticsources.Handler.stop()
@@ -439,8 +500,8 @@ func (pa *path) doDescribe(req defs.PathDescribeReq) {
 		return
 	}
 
-	if pa.conf.Fallback != "" {
-		req.Res <- defs.PathDescribeRes{Redirect: pa.conf.Fallback}
+	if pa.conf.Fallback != nil {
+		req.Res <- defs.PathDescribeRes{Redirect: *pa.conf.Fallback}
 		return
 	}
 
@@ -473,19 +534,35 @@ func (pa *path) doAddPublisher(req defs.PathAddPublisherReq) {
 		pa.executeRemovePublisher()
 	}
 
-	pa.source = req.Author
-	pa.publisherQuery = req.AccessRequest.Query
+	if !pa.conf.AlwaysAvailable {
+		err := pa.setAvailable(req.Author, req.AccessRequest.Query, req.Desc, req.ReplaceNTP)
+		if err != nil {
+			req.Res <- defs.PathAddPublisherRes{Err: err}
+			return
+		}
+	}
 
-	err := pa.setReady(req.Desc, req.UseRTPPackets, req.ReplaceNTP)
+	subStream := &stream.SubStream{
+		Stream:        pa.stream,
+		UseRTPPackets: req.UseRTPPackets,
+	}
+	if pa.conf.AlwaysAvailable {
+		subStream.CurDesc = req.Desc
+	}
+	err := subStream.Initialize()
 	if err != nil {
-		pa.source = nil
 		req.Res <- defs.PathAddPublisherRes{Err: err}
 		return
 	}
 
-	req.Author.Log(logger.Info, "is publishing to path '%s', %s",
-		pa.name,
-		defs.MediasInfo(req.Desc.Medias))
+	pa.source = req.Author
+
+	req.Author.Log(logger.Info, "is publishing to path '%s'",
+		pa.name)
+
+	if pa.conf.AlwaysAvailable {
+		pa.onlineTime = time.Now()
+	}
 
 	if pa.conf.HasOnDemandPublisher() && pa.onDemandPublisherState != pathOnDemandStateInitial {
 		pa.onDemandPublisherReadyTimer.Stop()
@@ -496,8 +573,8 @@ func (pa *path) doAddPublisher(req defs.PathAddPublisherReq) {
 	pa.consumeOnHoldRequests()
 
 	req.Res <- defs.PathAddPublisherRes{
-		Path:   pa,
-		Stream: pa.stream,
+		Path:      pa,
+		SubStream: subStream,
 	}
 }
 
@@ -550,44 +627,60 @@ func (pa *path) doAPIPathsGet(req pathAPIPathsGetReq) {
 		data: &defs.APIPath{
 			Name:     pa.name,
 			ConfName: pa.conf.Name,
-			Source: func() *defs.APIPathSourceOrReader {
+			Ready:    pa.isAvailable(),
+			ReadyTime: func() *time.Time {
+				if !pa.isAvailable() {
+					return nil
+				}
+				v := pa.availableTime
+				return &v
+			}(),
+			Available: pa.isAvailable(),
+			AvailableTime: func() *time.Time {
+				if !pa.isAvailable() {
+					return nil
+				}
+				v := pa.availableTime
+				return &v
+			}(),
+			Online: pa.isOnline(),
+			OnlineTime: func() *time.Time {
+				if !pa.isOnline() {
+					return nil
+				}
+				v := pa.onlineTime
+				return &v
+			}(),
+			Source: func() *defs.APIPathSource {
 				if pa.source == nil {
 					return nil
 				}
 				v := pa.source.APISourceDescribe()
-				return &v
-			}(),
-			Ready: pa.isReady(),
-			ReadyTime: func() *time.Time {
-				if !pa.isReady() {
-					return nil
-				}
-				v := pa.readyTime
-				return &v
+				return v
 			}(),
 			Tracks: func() []string {
-				if !pa.isReady() {
+				if !pa.isAvailable() {
 					return []string{}
 				}
 				return defs.MediasToCodecs(pa.stream.Desc.Medias)
 			}(),
 			BytesReceived: func() uint64 {
-				if !pa.isReady() {
+				if !pa.isAvailable() {
 					return 0
 				}
 				return pa.stream.BytesReceived()
 			}(),
 			BytesSent: func() uint64 {
-				if !pa.isReady() {
+				if !pa.isAvailable() {
 					return 0
 				}
 				return pa.stream.BytesSent()
 			}(),
-			Readers: func() []defs.APIPathSourceOrReader {
-				ret := make([]defs.APIPathSourceOrReader, len(pa.readers))
+			Readers: func() []defs.APIPathReader {
+				ret := make([]defs.APIPathReader, len(pa.readers))
 				i := 0
 				for r := range pa.readers {
-					ret[i] = r.APIReaderDescribe()
+					ret[i] = *r.APIReaderDescribe()
 					i++
 				}
 				return ret
@@ -688,24 +781,40 @@ func (pa *path) onDemandPublisherStop(reason string) {
 	pa.onDemandPublisherState = pathOnDemandStateInitial
 }
 
-func (pa *path) setReady(desc *description.Session, useRTPPackets bool, replaceNTP bool) error {
+func (pa *path) setAvailable(
+	source defs.Source,
+	publisherQuery string,
+	desc *description.Session,
+	replaceNTP bool,
+) error {
 	pa.stream = &stream.Stream{
-		Desc:              desc,
-		UseRTPPackets:     useRTPPackets,
-		WriteQueueSize:    pa.writeQueueSize,
-		RTPMaxPayloadSize: pa.rtpMaxPayloadSize,
-		ReplaceNTP:        replaceNTP,
-		Parent:            pa.source,
+		Desc:                  desc,
+		AlwaysAvailable:       pa.conf.AlwaysAvailable,
+		AlwaysAvailableTracks: pa.conf.AlwaysAvailableTracks,
+		AlwaysAvailableFile:   pa.conf.AlwaysAvailableFile,
+		WriteQueueSize:        pa.writeQueueSize,
+		RTPMaxPayloadSize:     pa.rtpMaxPayloadSize,
+		ReplaceNTP:            replaceNTP,
+		Parent:                pa,
 	}
 	err := pa.stream.Initialize()
 	if err != nil {
 		return err
 	}
 
-	pa.readyTime = time.Now()
+	pa.availableTime = time.Now()
+
+	if !pa.conf.AlwaysAvailable {
+		pa.onlineTime = time.Now()
+	}
 
 	if pa.conf.Record {
 		pa.startRecording()
+	}
+
+	var sourceDesc *defs.APIPathSource
+	if source != nil {
+		sourceDesc = source.APISourceDescribe()
 	}
 
 	pa.onNotReadyHook = hooks.OnReady(hooks.OnReadyParams{
@@ -713,11 +822,17 @@ func (pa *path) setReady(desc *description.Session, useRTPPackets bool, replaceN
 		ExternalCmdPool: pa.externalCmdPool,
 		Conf:            pa.conf,
 		ExternalCmdEnv:  pa.ExternalCmdEnv(),
-		Desc:            pa.source.APISourceDescribe(),
-		Query:           pa.publisherQuery,
+		Desc:            sourceDesc,
+		Query:           publisherQuery,
 	})
 
-	pa.parent.pathReady(pa)
+	if pa.conf.AlwaysAvailable {
+		pa.Log(logger.Info, "stream is available, %s", defs.MediasInfo(pa.stream.Desc.Medias))
+	} else {
+		pa.Log(logger.Info, "stream is available and online, %s", defs.MediasInfo(pa.stream.Desc.Medias))
+	}
+
+	pa.parent.setPathReady(pa)
 
 	return nil
 }
@@ -736,8 +851,8 @@ func (pa *path) consumeOnHoldRequests() {
 	pa.readerAddRequestsOnHold = nil
 }
 
-func (pa *path) setNotReady() {
-	pa.parent.pathNotReady(pa)
+func (pa *path) setNotAvailable() {
+	pa.parent.setPathNotReady(pa)
 
 	for r := range pa.readers {
 		pa.executeRemoveReader(r)
@@ -805,7 +920,14 @@ func (pa *path) executeRemoveReader(r defs.Reader) {
 }
 
 func (pa *path) executeRemovePublisher() {
-	pa.setNotReady()
+	if !pa.conf.AlwaysAvailable {
+		pa.setNotAvailable()
+	} else {
+		err := pa.stream.StartOfflineSubStream()
+		if err != nil {
+			panic("should not happen")
+		}
+	}
 	pa.source = nil
 }
 
@@ -900,11 +1022,11 @@ func (pa *path) describe(req defs.PathDescribeReq) defs.PathDescribeRes {
 }
 
 // addPublisher is called by a publisher through pathManager.
-func (pa *path) addPublisher(req defs.PathAddPublisherReq) (defs.Path, *stream.Stream, error) {
+func (pa *path) addPublisher(req defs.PathAddPublisherReq) (defs.Path, *stream.SubStream, error) {
 	select {
 	case pa.chAddPublisher <- req:
 		res := <-req.Res
-		return res.Path, res.Stream, res.Err
+		return res.Path, res.SubStream, res.Err
 	case <-pa.ctx.Done():
 		return nil, nil, fmt.Errorf("terminated")
 	}

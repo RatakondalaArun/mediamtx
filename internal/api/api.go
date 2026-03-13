@@ -20,7 +20,7 @@ import (
 )
 
 func interfaceIsEmpty(i any) bool {
-	return reflect.ValueOf(i).Kind() != reflect.Ptr || reflect.ValueOf(i).IsNil()
+	return reflect.ValueOf(i).Kind() != reflect.Pointer || reflect.ValueOf(i).IsNil()
 }
 
 func sortedKeys(paths map[string]*conf.Path) []string {
@@ -54,10 +54,10 @@ func recordingsOfPath(
 
 	segments, _ := recordstore.FindSegments(pathConf, pathName, nil, nil)
 
-	ret.Segments = make([]*defs.APIRecordingSegment, len(segments))
+	ret.Segments = make([]defs.APIRecordingSegment, len(segments))
 
 	for i, seg := range segments {
-		ret.Segments[i] = &defs.APIRecordingSegment{
+		ret.Segments[i] = defs.APIRecordingSegment{
 			Start: seg.Start,
 		}
 	}
@@ -80,6 +80,7 @@ type API struct {
 	Version        string
 	Started        time.Time
 	Address        string
+	DumpPackets    bool
 	Encryption     bool
 	ServerKey      string
 	ServerCert     string
@@ -183,15 +184,17 @@ func (a *API) Initialize() error {
 	group.DELETE("/recordings/deletesegment", a.onRecordingDeleteSegment)
 
 	a.httpServer = &httpp.Server{
-		Address:      a.Address,
-		AllowOrigins: a.AllowOrigins,
-		ReadTimeout:  time.Duration(a.ReadTimeout),
-		WriteTimeout: time.Duration(a.WriteTimeout),
-		Encryption:   a.Encryption,
-		ServerCert:   a.ServerCert,
-		ServerKey:    a.ServerKey,
-		Handler:      router,
-		Parent:       a,
+		Address:           a.Address,
+		AllowOrigins:      a.AllowOrigins,
+		DumpPackets:       a.DumpPackets,
+		DumpPacketsPrefix: "api_server_conn",
+		ReadTimeout:       time.Duration(a.ReadTimeout),
+		WriteTimeout:      time.Duration(a.WriteTimeout),
+		Encryption:        a.Encryption,
+		ServerCert:        a.ServerCert,
+		ServerKey:         a.ServerKey,
+		Handler:           router,
+		Parent:            a,
 	}
 	err := a.httpServer.Initialize()
 	if err != nil {

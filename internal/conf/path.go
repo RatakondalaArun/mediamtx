@@ -1,10 +1,12 @@
 package conf
 
 import (
-	"encoding/json"
+	"bytes"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
+	"os"
 	"reflect"
 	"regexp"
 	"sort"
@@ -12,6 +14,8 @@ import (
 	"time"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/mp4/codecs"
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/pmp4"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
@@ -64,6 +68,64 @@ func checkRedirect(v string) error {
 	return nil
 }
 
+func checkMP4MagicBytes(f io.ReadSeeker) error {
+	magicBytes := make([]byte, 4)
+
+	_, err := f.Seek(4, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	_, err = io.ReadFull(f, magicBytes)
+	if err != nil {
+		return err
+	}
+
+	if !bytes.Equal(magicBytes, []byte("ftyp")) {
+		return fmt.Errorf("file is not MP4, magic bytes are %v", magicBytes)
+	}
+
+	_, err = f.Seek(0, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func checkAlwaysAvailableFile(fpath string) error {
+	f, err := os.Open(fpath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	err = checkMP4MagicBytes(f)
+	if err != nil {
+		return err
+	}
+
+	var presentation pmp4.Presentation
+	err = presentation.Unmarshal(f)
+	if err != nil {
+		return err
+	}
+
+	if len(presentation.Tracks) == 0 {
+		return fmt.Errorf("file does not contain any track")
+	}
+
+	for _, track := range presentation.Tracks {
+		switch track.Codec.(type) {
+		case *codecs.AV1, *codecs.VP9, *codecs.H265, *codecs.H264, *codecs.Opus, *codecs.MPEG4Audio, *codecs.LPCM:
+		default:
+			return fmt.Errorf("unsupported codec %T", track.Codec)
+		}
+	}
+
+	return nil
+}
+
 // FindPathConf returns the configuration corresponding to the given path name.
 func FindPathConf(pathConfs map[string]*Path, name string) (*Path, []string, error) {
 	// normal path
@@ -106,10 +168,9 @@ func FindPathConf(pathConfs map[string]*Path, name string) (*Path, []string, err
 }
 
 // Path is a path configuration.
-// WARNING: Avoid using slices directly due to https://github.com/golang/go/issues/21092
 type Path struct {
-	Regexp *regexp.Regexp `json:"-"`    // filled by Check()
-	Name   string         `json:"name"` // filled by Check()
+	Regexp *regexp.Regexp `json:"-"`    // filled by Validate()
+	Name   string         `json:"name"` // filled by Validate()
 
 	// General
 	Source                     string   `json:"source"`
@@ -119,8 +180,13 @@ type Path struct {
 	SourceOnDemandCloseAfter   Duration `json:"sourceOnDemandCloseAfter"`
 	MaxReaders                 int      `json:"maxReaders"`
 	SRTReadPassphrase          string   `json:"srtReadPassphrase"`
-	Fallback                   string   `json:"fallback"`
+	Fallback                   *string  `json:"fallback,omitempty"` // deprecated
 	UseAbsoluteTimestamp       bool     `json:"useAbsoluteTimestamp"`
+
+	// Always available
+	AlwaysAvailable       bool                   `json:"alwaysAvailable"`
+	AlwaysAvailableTracks []AlwaysAvailableTrack `json:"alwaysAvailableTracks"`
+	AlwaysAvailableFile   string                 `json:"alwaysAvailableFile"`
 
 	// Record
 	Record                bool         `json:"record"`
@@ -146,13 +212,14 @@ type Path struct {
 	SRTPublishPassphrase     string `json:"srtPublishPassphrase"`
 
 	// RTSP source
-	RTSPTransport         RTSPTransport  `json:"rtspTransport"`
-	RTSPAnyPort           bool           `json:"rtspAnyPort"`
-	SourceProtocol        *RTSPTransport `json:"sourceProtocol,omitempty"`      // deprecated
-	SourceAnyPortEnable   *bool          `json:"sourceAnyPortEnable,omitempty"` // deprecated
-	RTSPRangeType         RTSPRangeType  `json:"rtspRangeType"`
-	RTSPRangeStart        string         `json:"rtspRangeStart"`
-	RTSPUDPReadBufferSize *uint          `json:"rtspUDPReadBufferSize,omitempty"` // deprecated
+	RTSPTransport          RTSPTransport  `json:"rtspTransport"`
+	RTSPAnyPort            bool           `json:"rtspAnyPort"`
+	SourceProtocol         *RTSPTransport `json:"sourceProtocol,omitempty"`      // deprecated
+	SourceAnyPortEnable    *bool          `json:"sourceAnyPortEnable,omitempty"` // deprecated
+	RTSPRangeType          RTSPRangeType  `json:"rtspRangeType"`
+	RTSPRangeStart         string         `json:"rtspRangeStart"`
+	RTSPUDPReadBufferSize  *uint          `json:"rtspUDPReadBufferSize,omitempty"` // deprecated
+	RTSPUDPSourcePortRange []uint         `json:"rtspUDPSourcePortRange"`
 
 	// MPEG-TS source
 	MPEGTSUDPReadBufferSize *uint `json:"mpegtsUDPReadBufferSize,omitempty"` // deprecated
@@ -160,6 +227,12 @@ type Path struct {
 	// RTP source
 	RTPSDP               string `json:"rtpSDP"`
 	RTPUDPReadBufferSize *uint  `json:"rtpUDPReadBufferSize,omitempty"` // deprecated
+
+	// WHEP source
+	WHEPBearerToken        string   `json:"whepBearerToken"`
+	WHEPSTUNGatherTimeout  Duration `json:"whepSTUNGatherTimeout"`
+	WHEPHandshakeTimeout   Duration `json:"whepHandshakeTimeout"`
+	WHEPTrackGatherTimeout Duration `json:"whepTrackGatherTimeout"`
 
 	// Redirect source
 	SourceRedirect string `json:"sourceRedirect"`
@@ -207,11 +280,11 @@ type Path struct {
 	RPICameraSoftwareH264Level     string    `json:"rpiCameraSoftwareH264Level"`
 	RPICameraJPEGQuality           *uint     `json:"rpiCameraJPEGQuality,omitempty"` // deprecated
 	RPICameraMJPEGQuality          uint      `json:"rpiCameraMJPEGQuality"`
-	RPICameraPrimaryName           string    `json:"-"` // filled by Check()
-	RPICameraSecondaryWidth        uint      `json:"-"` // filled by Check()
-	RPICameraSecondaryHeight       uint      `json:"-"` // filled by Check()
-	RPICameraSecondaryFPS          float64   `json:"-"` // filled by Check()
-	RPICameraSecondaryMJPEGQuality uint      `json:"-"` // filled by Check()
+	RPICameraPrimaryName           string    `json:"-"` // filled by Validate()
+	RPICameraSecondaryWidth        uint      `json:"-"` // filled by Validate()
+	RPICameraSecondaryHeight       uint      `json:"-"` // filled by Validate()
+	RPICameraSecondaryFPS          float64   `json:"-"` // filled by Validate()
+	RPICameraSecondaryMJPEGQuality uint      `json:"-"` // filled by Validate()
 
 	// Hooks
 	RunOnInit                  string   `json:"runOnInit"`
@@ -247,6 +320,14 @@ func (pconf *Path) setDefaults() {
 
 	// Publisher source
 	pconf.OverridePublisher = true
+
+	// RTSP source
+	pconf.RTSPUDPSourcePortRange = []uint{10000, 65535}
+
+	// WHEP source
+	pconf.WHEPSTUNGatherTimeout = Duration(5 * time.Second)
+	pconf.WHEPHandshakeTimeout = Duration(10 * time.Second)
+	pconf.WHEPTrackGatherTimeout = Duration(2 * time.Second)
 
 	// Raspberry Pi Camera source
 	pconf.RPICameraWidth = 1920
@@ -287,25 +368,8 @@ func newPath(defaults *Path, partial *OptionalPath) *Path {
 
 // Clone clones the configuration.
 func (pconf Path) Clone() *Path {
-	enc, err := json.Marshal(pconf)
-	if err != nil {
-		panic(err)
-	}
-
-	var dest Path
-	err = json.Unmarshal(enc, &dest)
-	if err != nil {
-		panic(err)
-	}
-
-	dest.Regexp = pconf.Regexp
-	dest.RPICameraPrimaryName = pconf.RPICameraPrimaryName
-	dest.RPICameraSecondaryWidth = pconf.RPICameraSecondaryWidth
-	dest.RPICameraSecondaryHeight = pconf.RPICameraSecondaryHeight
-	dest.RPICameraSecondaryFPS = pconf.RPICameraSecondaryFPS
-	dest.RPICameraSecondaryMJPEGQuality = pconf.RPICameraSecondaryMJPEGQuality
-
-	return &dest
+	cloned := deepClone(reflect.ValueOf(pconf)).Interface().(Path)
+	return &cloned
 }
 
 func (pconf *Path) validate(
@@ -336,25 +400,15 @@ func (pconf *Path) validate(
 
 	// common configuration errors
 
-	if pconf.Source != "publisher" && pconf.Source != "redirect" &&
-		pconf.Regexp != nil && !pconf.SourceOnDemand {
-		return fmt.Errorf("a path with a regular expression (or path 'all') and a static source" +
-			" must have 'sourceOnDemand' set to true")
-	}
-
 	if pconf.SRTPublishPassphrase != "" && pconf.Source != "publisher" {
 		return fmt.Errorf("'srtPublishPassphase' can only be used when source is 'publisher'")
-	}
-
-	if pconf.SourceOnDemand && pconf.Source == "publisher" {
-		return fmt.Errorf("'sourceOnDemand' is useless when source is 'publisher'")
 	}
 
 	if pconf.Source != "redirect" && pconf.SourceRedirect != "" {
 		return fmt.Errorf("'sourceRedirect' is useless when source is not 'redirect'")
 	}
 
-	// source-dependent settings
+	// General
 
 	switch {
 	case pconf.Source == "publisher":
@@ -449,6 +503,7 @@ func (pconf *Path) validate(
 		}
 
 	case strings.HasPrefix(pconf.Source, "unix+rtp://"):
+		l.Log(logger.Warn, "source 'unix+rtp' is deprecated due to intrinsic instability, use 'udp+rtp' instead")
 		if pconf.RTPSDP == "" {
 			return fmt.Errorf("`rtpSDP` was not provided")
 		}
@@ -632,6 +687,17 @@ func (pconf *Path) validate(
 		return fmt.Errorf("invalid source: '%s'", pconf.Source)
 	}
 
+	if pconf.SourceOnDemand {
+		if pconf.Source == "publisher" {
+			return fmt.Errorf("'sourceOnDemand' is useless when source is 'publisher'")
+		}
+	} else {
+		if pconf.Source != "publisher" && pconf.Source != "redirect" && pconf.Regexp != nil {
+			return fmt.Errorf("a path with a regular expression (or path 'all') and a static source" +
+				" must have 'sourceOnDemand' set to true")
+		}
+	}
+
 	if pconf.SRTReadPassphrase != "" {
 		err := checkSRTPassphrase(pconf.SRTReadPassphrase)
 		if err != nil {
@@ -639,10 +705,44 @@ func (pconf *Path) validate(
 		}
 	}
 
-	if pconf.Fallback != "" {
-		err := checkRedirect(pconf.Fallback)
+	if pconf.Fallback != nil {
+		l.Log(logger.Warn, "the 'fallback' feature is deprecated, use 'alwaysAvailable' instead")
+		err := checkRedirect(*pconf.Fallback)
 		if err != nil {
 			return err
+		}
+	}
+
+	// Always available
+
+	if pconf.AlwaysAvailable {
+		if pconf.Regexp != nil {
+			return fmt.Errorf("'alwaysAvailable' cannot be used in a path with a regular expression (or path 'all')")
+		}
+
+		if pconf.SourceOnDemand {
+			return fmt.Errorf("'sourceOnDemand' is not compatible with 'alwaysAvailable'")
+		}
+
+		if pconf.RunOnDemand != "" || pconf.RunOnUnDemand != "" {
+			return fmt.Errorf("'runOnDemand' and 'runOnUnDemand' cannot be used with 'alwaysAvailable'")
+		}
+
+		if pconf.AlwaysAvailableFile != "" {
+			if len(pconf.AlwaysAvailableTracks) != 0 {
+				return fmt.Errorf("'alwaysAvailableFile' and 'alwaysAvailableTracks' cannot be used together")
+			}
+
+			err := checkAlwaysAvailableFile(pconf.AlwaysAvailableFile)
+			if err != nil {
+				return fmt.Errorf("invalid 'alwaysAvailableFile': %w", err)
+			}
+		} else if len(pconf.AlwaysAvailableTracks) == 0 {
+			return fmt.Errorf("'alwaysAvailableTracks' must contain at least one track")
+		}
+
+		if pconf.UseAbsoluteTimestamp {
+			return fmt.Errorf("'useAbsoluteTimestamp' cannot be used with 'alwaysAvailable'")
 		}
 	}
 
@@ -752,6 +852,7 @@ func (pconf *Path) validate(
 		return fmt.Errorf("a path with a regular expression (or path 'all')" +
 			" does not support option 'runOnInit'; use another path")
 	}
+
 	if (pconf.RunOnDemand != "" || pconf.RunOnUnDemand != "") && pconf.Source != "publisher" {
 		return fmt.Errorf("'runOnDemand' and 'runOnUnDemand' can be used only when source is 'publisher'")
 	}

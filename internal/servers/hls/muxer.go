@@ -21,7 +21,9 @@ const (
 )
 
 func ptrOf[T any](v T) *T {
-	return &v
+	p := new(T)
+	*p = v
+	return p
 }
 
 func emptyTimer() *time.Timer {
@@ -245,8 +247,8 @@ func (m *muxer) getInstance() *muxerInstance {
 }
 
 // APIReaderDescribe implements reader.
-func (m *muxer) APIReaderDescribe() defs.APIPathSourceOrReader {
-	return defs.APIPathSourceOrReader{
+func (m *muxer) APIReaderDescribe() *defs.APIPathReader {
+	return &defs.APIPathReader{
 		Type: "hlsMuxer",
 		ID:   "",
 	}

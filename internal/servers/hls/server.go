@@ -19,7 +19,7 @@ import (
 var ErrMuxerNotFound = errors.New("muxer not found")
 
 func interfaceIsEmpty(i any) bool {
-	return reflect.ValueOf(i).Kind() != reflect.Ptr || reflect.ValueOf(i).IsNil()
+	return reflect.ValueOf(i).Kind() != reflect.Pointer || reflect.ValueOf(i).IsNil()
 }
 
 type serverGetMuxerRes struct {
@@ -71,6 +71,7 @@ type serverParent interface {
 // Server is a HLS server.
 type Server struct {
 	Address         string
+	DumpPackets     bool
 	Encryption      bool
 	ServerKey       string
 	ServerCert      string
@@ -121,6 +122,7 @@ func (s *Server) Initialize() error {
 
 	s.httpServer = &httpServer{
 		address:        s.Address,
+		dumpPackets:    s.DumpPackets,
 		encryption:     s.Encryption,
 		serverKey:      s.ServerKey,
 		serverCert:     s.ServerCert,
@@ -217,11 +219,11 @@ outer:
 
 		case req := <-s.chAPIMuxerList:
 			data := &defs.APIHLSMuxerList{
-				Items: []*defs.APIHLSMuxer{},
+				Items: []defs.APIHLSMuxer{},
 			}
 
 			for _, muxer := range s.muxers {
-				data.Items = append(data.Items, muxer.apiItem())
+				data.Items = append(data.Items, *muxer.apiItem())
 			}
 
 			sort.Slice(data.Items, func(i, j int) bool {

@@ -47,7 +47,7 @@ func resolveSource(s string, matches []string, query string) string {
 type staticSource interface {
 	logger.Writer
 	Run(defs.StaticSourceRunParams) error
-	APISourceDescribe() defs.APIPathSourceOrReader
+	APISourceDescribe() *defs.APIPathSource
 }
 
 type handlerPathManager interface {
@@ -64,6 +64,7 @@ type handlerParent interface {
 type Handler struct {
 	Conf              *conf.Path
 	LogLevel          conf.LogLevel
+	DumpPackets       bool
 	ReadTimeout       conf.Duration
 	WriteTimeout      conf.Duration
 	WriteQueueSize    int
@@ -102,6 +103,7 @@ func (s *Handler) Initialize() {
 		strings.HasPrefix(s.Conf.Source, "rtsp+ws://") ||
 		strings.HasPrefix(s.Conf.Source, "rtsps+ws://"):
 		s.instance = &ssrtsp.Source{
+			DumpPackets:       s.DumpPackets,
 			ReadTimeout:       s.ReadTimeout,
 			WriteTimeout:      s.WriteTimeout,
 			WriteQueueSize:    s.WriteQueueSize,
@@ -112,6 +114,7 @@ func (s *Handler) Initialize() {
 	case strings.HasPrefix(s.Conf.Source, "rtmp://") ||
 		strings.HasPrefix(s.Conf.Source, "rtmps://"):
 		s.instance = &ssrtmp.Source{
+			DumpPackets:  s.DumpPackets,
 			ReadTimeout:  s.ReadTimeout,
 			WriteTimeout: s.WriteTimeout,
 			Parent:       s,
@@ -120,6 +123,7 @@ func (s *Handler) Initialize() {
 	case strings.HasPrefix(s.Conf.Source, "http://") ||
 		strings.HasPrefix(s.Conf.Source, "https://"):
 		s.instance = &sshls.Source{
+			DumpPackets: s.DumpPackets,
 			ReadTimeout: s.ReadTimeout,
 			Parent:      s,
 		}
@@ -128,6 +132,7 @@ func (s *Handler) Initialize() {
 		strings.HasPrefix(s.Conf.Source, "udp+mpegts://") ||
 		strings.HasPrefix(s.Conf.Source, "unix+mpegts://"):
 		s.instance = &ssmpegts.Source{
+			DumpPackets:       s.DumpPackets,
 			ReadTimeout:       s.ReadTimeout,
 			UDPReadBufferSize: s.UDPReadBufferSize,
 			Parent:            s,
@@ -142,6 +147,7 @@ func (s *Handler) Initialize() {
 	case strings.HasPrefix(s.Conf.Source, "whep://") ||
 		strings.HasPrefix(s.Conf.Source, "wheps://"):
 		s.instance = &sswebrtc.Source{
+			DumpPackets:       s.DumpPackets,
 			ReadTimeout:       s.ReadTimeout,
 			UDPReadBufferSize: s.UDPReadBufferSize,
 			Parent:            s,
@@ -150,6 +156,7 @@ func (s *Handler) Initialize() {
 	case strings.HasPrefix(s.Conf.Source, "udp+rtp://") ||
 		strings.HasPrefix(s.Conf.Source, "unix+rtp://"):
 		s.instance = &ssrtp.Source{
+			DumpPackets:       s.DumpPackets,
 			ReadTimeout:       s.ReadTimeout,
 			UDPReadBufferSize: s.UDPReadBufferSize,
 			Parent:            s,
@@ -300,7 +307,7 @@ func (s *Handler) ReloadConf(newConf *conf.Path) {
 }
 
 // APISourceDescribe instanceements source.
-func (s *Handler) APISourceDescribe() defs.APIPathSourceOrReader {
+func (s *Handler) APISourceDescribe() *defs.APIPathSource {
 	return s.instance.APISourceDescribe()
 }
 
@@ -309,13 +316,7 @@ func (s *Handler) SetReady(req defs.PathSourceStaticSetReadyReq) defs.PathSource
 	req.Res = make(chan defs.PathSourceStaticSetReadyRes)
 	select {
 	case s.chInstanceSetReady <- req:
-		res := <-req.Res
-
-		if res.Err == nil {
-			s.instance.Log(logger.Info, "ready: %s", defs.MediasInfo(req.Desc.Medias))
-		}
-
-		return res
+		return <-req.Res
 
 	case <-s.ctx.Done():
 		return defs.PathSourceStaticSetReadyRes{Err: fmt.Errorf("terminated")}
